@@ -24,3 +24,11 @@
 为了实现高亮功能，首先确保配置成功 https://www.gradio.app/guides/pdf-component-example ，能够成功运行里面的demo，然后进行修改：(实际上就是pdf.js库的魔改和应用)
 - 文字复制参考资料：https://segmentfault.com/a/1190000042089590
 - 高亮相关参考资料：https://www.cnblogs.com/Beson/p/16372402.html   https://blog.csdn.net/wang13679201813/article/details/129798858  
+
+## 如何使用各种推理接口
+- qwen2 7b模型：可以去 siliconflow 申请免费的API KEY，在CDQA/models/fastchat_qwen2_7b_llm.py填写相应的KEY
+- HuoZi：先在web登录https://huozi.8wss.com/，然后用https://huozi.8wss.com/api得到api。
+- qwen 72b：先安装好相应的依赖，然后使用3个bash开下面3个命令：
+python -m fastchat.serve.controller  
+python -m fastchat.serve.vllm_worker --model-path /home/zrchen/yongyou/qwen70b/Qwen-72B-Chat(72b模型地址) --trust-remote-code --tensor-parallel-size 2 --gpu-memory-utilization 0.95 --dtype bfloat16  
+python -m fastchat.serve.openai_api_server --host localhost --port 5214
