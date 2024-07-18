@@ -1,0 +1,539 @@
+from langchain.embeddings.huggingface import HuggingFaceEmbeddings
+from vectorstores import MyFAISS
+from langchain.document_loaders import UnstructuredFileLoader, TextLoader, CSVLoader
+from configs.model_config import *
+import math
+import datetime
+from textsplitter import ChineseTextSplitter
+from typing import List
+from utils import torch_gc
+from tqdm import tqdm
+from pypinyin import lazy_pinyin
+from loader import UnstructuredPaddleImageLoader, UnstructuredPaddlePDFLoader
+from models.base import (BaseAnswer,
+                         AnswerResult)
+from models.loader.args import parser
+from models.loader import LoaderCheckPoint
+import models.shared as shared
+from agent import bing_search
+from langchain.docstore.document import Document
+from functools import lru_cache
+
+
+# patch HuggingFaceEmbeddings to make it hashable
+def _embeddings_hash(self):
+    return hash(self.model_name)
+
+
+HuggingFaceEmbeddings.__hash__ = _embeddings_hash
+
+
+# will keep CACHED_VS_NUM of vector store caches
+@lru_cache(CACHED_VS_NUM)
+def load_vector_store(vs_path, embeddings):
+    return MyFAISS.load_local(vs_path, embeddings, allow_dangerous_deserialization=True)
+
+
+def tree(filepath, ignore_dir_names=None, ignore_file_names=None):
+    """返回两个列表，第一个列表为 filepath 下全部文件的完整路径, 第二个为对应的文件名"""
+    if ignore_dir_names is None:
+        ignore_dir_names = []
+    if ignore_file_names is None:
+        ignore_file_names = []
+    ret_list = []
+    if isinstance(filepath, str):
+        if not os.path.exists(filepath):
+            print("路径不存在")
+            return None, None
+        elif os.path.isfile(filepath) and os.path.basename(filepath) not in ignore_file_names:
+            return [filepath], [os.path.basename(filepath)]
+        elif os.path.isdir(filepath) and os.path.basename(filepath) not in ignore_dir_names:
+            for file in os.listdir(filepath):
+                fullfilepath = os.path.join(filepath, file)
+                if os.path.isfile(fullfilepath) and os.path.basename(fullfilepath) not in ignore_file_names:
+                    ret_list.append(fullfilepath)
+                if os.path.isdir(fullfilepath) and os.path.basename(fullfilepath) not in ignore_dir_names:
+                    ret_list.extend(tree(fullfilepath, ignore_dir_names, ignore_file_names)[0])
+    return ret_list, [os.path.basename(p) for p in ret_list]
+
+
+def load_file(filepath, sentence_size=SENTENCE_SIZE):
+    if filepath.lower().endswith(".md"):
+        loader = UnstructuredFileLoader(filepath, mode="elements")
+        docs = loader.load()
+    elif filepath.lower().endswith(".txt"):
+        loader = TextLoader(filepath, autodetect_encoding=True)
+        textsplitter = ChineseTextSplitter(pdf=False, sentence_size=sentence_size)
+        docs = loader.load_and_split(textsplitter)
+    elif filepath.lower().endswith(".pdf"):
+        # print("暂时跳过pdf加载")
+        loader = UnstructuredPaddlePDFLoader(filepath)
+        textsplitter = ChineseTextSplitter(pdf=True, sentence_size=sentence_size)
+        docs = loader.load_and_split(textsplitter)
+    elif filepath.lower().endswith(".jpg") or filepath.lower().endswith(".png"):
+        print("暂时跳过pdf加载")
+        # loader = UnstructuredPaddleImageLoader(filepath, mode="elements")
+        # textsplitter = ChineseTextSplitter(pdf=False, sentence_size=sentence_size)
+        # docs = loader.load_and_split(text_splitter=textsplitter)
+    elif filepath.lower().endswith(".csv"):
+        loader = CSVLoader(filepath)
+        docs = loader.load()
+    else:
+        loader = UnstructuredFileLoader(filepath, mode="elements")
+        textsplitter = ChineseTextSplitter(pdf=False, sentence_size=sentence_size)
+        docs = loader.load_and_split(text_splitter=textsplitter)
+    write_check_file(filepath, docs)
+    return docs
+
+
+def write_check_file(filepath, docs):
+    folder_path = os.path.join(os.path.dirname(filepath), "tmp_files")
+    if not os.path.exists(folder_path):
+        os.makedirs(folder_path)
+    fp = os.path.join(folder_path, 'load_file.txt')
+    with open(fp, 'a+', encoding='utf-8') as fout:
+        fout.write("filepath=%s,len=%s" % (filepath, len(docs)))
+        fout.write('\n')
+        for i in docs:
+            fout.write(str(i))
+            fout.write('\n')
+        fout.close()
+
+def generate_step1_prompt(related_docs: List[str],
+                    query: str,
+                    prompt_template: str = PROMPT_TEMPLATE, ) -> str:
+    # context = "\n".join([doc.page_content for doc in related_docs])
+    # print(related_docs)
+    context = "\n".join([('['+str(i+1)+']' + str(related_docs[i].page_content) )for i in range(len(related_docs))])
+    # context = "\n".join([related_docs[0].page_content])
+    prompt = prompt_template.replace("{question}", query).replace("{context}", context)
+    print(prompt)
+    return prompt
+
+def generate_prompt_COT_qw_step_fin(related_docs_now, query,qianxu_tasks,task_anwers,sample_task):
+    # context = "\n".join([doc.page_content for doc in related_docs])
+    # print(related_docs)
+    cankao = []
+    if len(qianxu_tasks) != 0:
+        d_prompt = f'- 问题是：{query}\n- 子任务及其答案包括：\n'
+        for i, t in enumerate(qianxu_tasks):
+            d_prompt = d_prompt +f'  {i+1}.子任务{i+1}：'+  str(t) + '。答案：' + str(task_anwers[i]) + '\n'  
+    print(d_prompt)
+    return PROMPT_COT_QW_STEP_FIN , d_prompt,cankao
+
+def generate_prompt_COT_qw_step(related_docs_now, query,qianxu_tasks,task_anwers,sample_task):
+    # context = "\n".join([doc.page_content for doc in related_docs])
+    # print(related_docs)
+    cankao = []
+    if len(qianxu_tasks) != 0:
+        d_prompt = f'- 问题是：{query}\n- 当前子任务是：{sample_task}\n'
+        context = "\n".join([('['+str(i+1)+']' + str(related_docs_now[i].page_content) )for i in range(len(related_docs_now))])
+        cankao.append(str(context))
+        d_prompt = d_prompt +f'- 当前子任务的参考资料：'+ str(context) + '\n'
+        d_prompt = d_prompt +f'- 前序子任务包括：''\n'
+        for i, t in enumerate(qianxu_tasks):
+            d_prompt = d_prompt +f'  {i+1}.子任务{i+1}：'+  str(t) + '。答案：' + str(task_anwers[i]) + '\n'
+    else:#第一个任务
+        d_prompt = f'- 问题是：{query}\n- 当前子任务是：{sample_task}\n'
+        context = "\n".join([('['+str(i+1)+']' + str(related_docs_now[i].page_content) )for i in range(len(related_docs_now))])
+        d_prompt = d_prompt +f'- 当前子任务的参考资料：'+ str(context) + '\n'
+        d_prompt = d_prompt +f'- 当前子任务是第一个子任务，无前序子任务。''\n'    
+    print(d_prompt)
+    return PROMPT_COT_QW_STEP , d_prompt,cankao
+
+def generate_prompt_COT_qw(related_docs,
+                    query: str,ret_list,
+                    prompt_template: str = PROMPT_COT, ) -> str:
+    # context = "\n".join([doc.page_content for doc in related_docs])
+    # print(related_docs)
+    i = 0
+    d_prompt = f'- 问题是：{query}\n- 子任务包括：\n'
+    cankao = []
+    for doc in related_docs:       
+        context = "\n".join([('['+str(i+1)+']' + str(doc[i].page_content) )for i in range(len(doc))])
+        cankao.append(str(context))
+        d_task = ret_list[i]
+        d_prompt = d_prompt +f'  {i+1}. '+  str(d_task) + '，参考资料：' + str(context) + '\n'
+        i = i + 1
+    print(d_prompt)
+    return PROMPT_COT_QW , d_prompt,cankao
+def generate_prompt_COT(related_docs,
+                    query: str,ret_list,
+                    prompt_template: str = PROMPT_COT, ) -> str:
+    # context = "\n".join([doc.page_content for doc in related_docs])
+    # print(related_docs)
+    i = 0
+    d_prompt = ''
+    for doc in related_docs:        
+        context = "\n".join([('['+str(i+1)+']' + str(doc[i].page_content) )for i in range(len(doc))])
+        d_task = ret_list[i]
+        d_prompt = '*' + str(d_task) + ',参考资料:' + str(context) + ','
+        i = i + 1
+    d_prompt = d_prompt[:-1]
+    # context = "\n".join([related_docs[0].page_content])
+    prompt = prompt_template.replace("{question}", query).replace("{chain}", d_prompt)
+    print(prompt)
+    return prompt
+def generate_prompt(related_docs,
+                    query: str,
+                    prompt_template: str = PROMPT_TEMPLATE, ):
+    # context = "\n".join([doc.page_content for doc in related_docs])
+    # print(related_docs)
+    context = "\n".join([('['+str(i+1)+']' + str(related_docs[i].page_content) )for i in range(len(related_docs))])
+    # context = "\n".join([related_docs[0].page_content])
+    prompt = prompt_template.replace("{question}", query).replace("{context}", context)
+    print(prompt)
+    return prompt
+def generate_prompt_divide_task(
+                    query: str,
+                    prompt_template: str = PROMPT_DIVIDE_TASK, ):
+    prompt = prompt_template.replace("{question}", query)
+    return prompt
+
+def generate_prompt_divide_task_qwen(
+                    query: str,
+                    prompt_template: str = PROMPT_DIVIDE_TASK, ):
+    return PROMPT_DIVIDE_TASK_QWEN, query
+
+
+def search_result2docs(search_results):
+    docs = []
+    for result in search_results:
+        doc = Document(page_content=result["snippet"] if "snippet" in result.keys() else "",
+                       metadata={"source": result["link"] if "link" in result.keys() else "",
+                                 "filename": result["title"] if "title" in result.keys() else ""})
+        docs.append(doc)
+    return docs
+
+
+class LocalDocQA:
+    llm: BaseAnswer = None
+    embeddings: object = None
+    top_k: int = VECTOR_SEARCH_TOP_K
+    chunk_size: int = CHUNK_SIZE
+    chunk_conent: bool = True
+    score_threshold: int = VECTOR_SEARCH_SCORE_THRESHOLD
+
+    def init_cfg(self,
+                 embedding_model: str = EMBEDDING_MODEL,
+                 embedding_device=EMBEDDING_DEVICE,
+                 llm_model: BaseAnswer = None,
+                 top_k=VECTOR_SEARCH_TOP_K,
+                 ):
+        self.llm = llm_model
+        self.embeddings = HuggingFaceEmbeddings(model_name=embedding_model_dict[embedding_model],
+                                                model_kwargs={'device': embedding_device})
+        self.top_k = top_k
+
+    def init_knowledge_vector_store(self,
+                                    filepath: str or List[str],
+                                    vs_path: str or os.PathLike = None,
+                                    sentence_size=SENTENCE_SIZE):
+        loaded_files = []
+        failed_files = []
+        if isinstance(filepath, str):
+            if not os.path.exists(filepath):
+                print("路径不存在")
+                return None
+            elif os.path.isfile(filepath):
+                file = os.path.split(filepath)[-1]
+                try:
+                    docs = load_file(filepath, sentence_size)
+                    logger.info(f"{file} 已成功加载")
+                    loaded_files.append(filepath)
+                except Exception as e:
+                    logger.error(e)
+                    logger.info(f"{file} 未能成功加载")
+                    return None
+            elif os.path.isdir(filepath):
+                docs = []
+                for fullfilepath, file in tqdm(zip(*tree(filepath, ignore_dir_names=['tmp_files'])), desc="加载文件"):
+                    try:
+                        docs += load_file(fullfilepath, sentence_size)
+                        loaded_files.append(fullfilepath)
+                    except Exception as e:
+                        logger.error(e)
+                        failed_files.append(file)
+
+                if len(failed_files) > 0:
+                    logger.info("以下文件未能成功加载：")
+                    for file in failed_files:
+                        logger.info(f"{file}\n")
+
+        else:
+            docs = []
+            for file in filepath:
+                try:
+                    docs += load_file(file)
+                    logger.info(f"{file} 已成功加载")
+                    loaded_files.append(file)
+                except Exception as e:
+                    logger.error(e)
+                    logger.info(f"{file} 未能成功加载")
+        if len(docs) > 0:
+            logger.info("文件加载完毕，正在生成向量库")
+            if vs_path and os.path.isdir(vs_path) and "index.faiss" in os.listdir(vs_path):
+                vector_store = load_vector_store(vs_path, self.embeddings)
+                vector_store.add_documents(docs)
+                torch_gc()
+            else:
+                if not vs_path:
+                    vs_path = os.path.join(KB_ROOT_PATH,
+                                           f"""{"".join(lazy_pinyin(os.path.splitext(file)[0]))}_FAISS_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}""",
+                                           "vector_store")
+                vector_store = MyFAISS.from_documents(docs, self.embeddings)  # docs 为Document列表
+                torch_gc()
+
+            vector_store.save_local(vs_path)
+            return vs_path, loaded_files
+        else:
+            logger.info("文件均未成功加载，请检查依赖包或替换为其他文件再次上传。")
+            return None, loaded_files
+
+    def one_knowledge_add(self, vs_path, one_title, one_conent, one_content_segmentation, sentence_size):
+        print(vs_path)
+        try:
+            if not vs_path or not one_title or not one_conent:
+                logger.info("知识库添加错误，请确认知识库名字、标题、内容是否正确！")
+                return None, [one_title]
+            docs = [Document(page_content=one_conent + "\n", metadata={"source": one_title})]
+            if not one_content_segmentation:
+                text_splitter = ChineseTextSplitter(pdf=False, sentence_size=sentence_size)
+                docs = text_splitter.split_documents(docs)
+            if os.path.isdir(vs_path) and os.path.isfile(vs_path + "/index.faiss"):
+                vector_store = load_vector_store(vs_path, self.embeddings)
+                vector_store.add_documents(docs)
+            else:
+                vector_store = MyFAISS.from_documents(docs, self.embeddings)  ##docs 为Document列表
+            torch_gc()
+            vector_store.save_local(vs_path)
+            return vs_path, [one_title]
+        except Exception as e:
+            print(e)
+            logger.error(e)
+            return None, [one_title]
+    def get_knowledge_based_answer_divide_task(self,query, vs_path, chat_history=[], streaming: bool = STREAMING):
+        # prompt = generate_prompt_divide_task(query)
+        sys,query = generate_prompt_divide_task_qwen(query)
+        for answer_result in self.llm.generatorAnswer_task_devide(prompt=query, system = sys,history=chat_history,
+                                                      streaming=streaming):
+            resp = answer_result.llm_output["answer"]
+            yield resp
+
+    def get_knowledge_based_answer_divide_task_agent(self,query, agent):
+        return agent.process_single_qa(query=query)
+    
+    def retrival_relative_docs(self,q,vs_path):
+        vector_store = load_vector_store(vs_path, self.embeddings)
+        vector_store.chunk_size = self.chunk_size
+        vector_store.chunk_conent = self.chunk_conent
+        vector_store.score_threshold = self.score_threshold
+        related_docs_with_score = vector_store.similarity_search_with_score(q, k=self.top_k) 
+        ret = "\n".join([('['+str(i+1)+']' + str(related_docs_with_score[i].page_content) )for i in range(len(related_docs_with_score))])
+        return ret
+
+    def get_knowledge_based_answer_agent(self,query, vs_path, agent, ret_list = None):
+        vector_store = load_vector_store(vs_path, self.embeddings)
+        vector_store.chunk_size = self.chunk_size
+        vector_store.chunk_conent = self.chunk_conent
+        vector_store.score_threshold = self.score_threshold
+        related_docs = []
+        for i in ret_list:
+            related_docs.append(vector_store.similarity_search_with_score(i, k=max(math.ceil(self.top_k/len(ret_list)),1)))
+        if len(related_docs) > 0:
+            sys,prompt,docs = generate_prompt_COT_qw(related_docs, query,ret_list)
+        else:
+            prompt = query
+            sys = PROMPT_COT_QW
+        answer_result = agent.process_single_qa(query=prompt, sys =sys)
+        response = {"query": query,
+                    "result": answer_result,
+                    "source_documents": related_docs
+                    }
+        return response
+
+    def get_knowledge_based_answer(self,query, vs_path, chat_history=[], ret_list = None, streaming: bool = STREAMING, chains = False):
+        if ret_list == None:
+            vector_store = load_vector_store(vs_path, self.embeddings)
+            vector_store.chunk_size = self.chunk_size
+            vector_store.chunk_conent = self.chunk_conent
+            vector_store.score_threshold = self.score_threshold
+            related_docs_with_score = vector_store.similarity_search_with_score(query, k=self.top_k)
+            # 检索增强  意图识别 针对query进行意图识别
+            torch_gc()
+            if len(related_docs_with_score) > 0:
+                prompt = generate_prompt(related_docs_with_score, query)
+            else:
+                prompt = query
+
+            for answer_result in self.llm.generatorAnswer(prompt=prompt, history=chat_history,
+                                                        streaming=streaming):
+                resp = answer_result.llm_output["answer"]
+                history = answer_result.history
+                history[-1][0] = '<用户提问:' + query + '。>'
+                response = {"query": query,
+                            "result": resp,
+                            "source_documents": related_docs_with_score,
+                            }
+                yield response, history
+        elif chains == False:
+            print(vs_path)
+            vector_store = load_vector_store(vs_path, self.embeddings)
+            vector_store.chunk_size = self.chunk_size
+            vector_store.chunk_conent = self.chunk_conent
+            vector_store.score_threshold = self.score_threshold
+            related_docs = []
+            for i in ret_list:
+                related_docs.append(vector_store.similarity_search_with_score(i, k=max(math.ceil(self.top_k/len(ret_list)),1)))
+            if len(related_docs) > 0:
+                sys,prompt,docs = generate_prompt_COT_qw(related_docs, query,ret_list)
+            else:
+                prompt = query
+                sys = PROMPT_COT_QW
+                docs = vector_store.similarity_search_with_score(query, k=3)
+            for answer_result in self.llm.generatorAnswer(prompt=prompt, system =sys, history=chat_history,
+                                                    streaming=streaming):
+                resp = answer_result.llm_output["answer"]
+                history = answer_result.history
+                history[-1][0] = '<用户提问:' + query + '。>'
+                response = {"query": query,
+                            "result": resp,
+                            "source_documents": related_docs,
+                            'relate_docs':docs
+                            }
+                yield response, history
+        else:
+            vector_store = load_vector_store(vs_path, self.embeddings)
+            vector_store.chunk_size = self.chunk_size
+            vector_store.chunk_conent = self.chunk_conent
+            vector_store.score_threshold = self.score_threshold
+            cankao = []
+            related_docs = []
+            for i in ret_list:
+                related_docs.append(vector_store.similarity_search_with_score(i, k=self.top_k))
+            task_anwers = []
+            for enu, sample_task in enumerate(ret_list):
+                related_docs_now = related_docs[enu]
+                if enu != 0:
+                    qianxu_tasks = ret_list[:enu]
+                else:
+                    qianxu_tasks = []
+                sys,prompt,docs = generate_prompt_COT_qw_step(related_docs_now, query,qianxu_tasks,task_anwers,sample_task)
+                cankao.entend(docs)
+                for answer_result in self.llm.generatorAnswer(prompt=prompt, system =sys, history=chat_history,
+                                                        streaming=streaming):
+                    resp = answer_result.llm_output["answer"]
+                    task_anwers.append(resp)
+
+            sys,prompt,_ = generate_prompt_COT_qw_step_fin(related_docs_now, query,qianxu_tasks,task_anwers,sample_task)
+            for answer_result in self.llm.generatorAnswer(prompt=prompt, system =sys, history=chat_history,
+                                                    streaming=streaming):
+                resp = answer_result.llm_output["answer"]
+                task_anwers.append(resp)
+                history = answer_result.history
+                history[-1][0] = '<用户提问:' + query + '。>'
+                response = {"query": query,
+                            "result": resp,
+                            "source_documents": related_docs,
+                            'relate_docs':cankao,
+                            'all_tasks_answers':task_anwers
+                            }
+                yield response, history            
+
+    # query      查询内容
+    # vs_path    知识库路径
+    # chunk_conent   是否启用上下文关联
+    # score_threshold    搜索匹配score阈值
+    # vector_search_top_k   搜索知识库内容条数，默认搜索5条结果
+    # chunk_sizes    匹配单段内容的连接上下文长度
+    def get_knowledge_based_conent_test(self, query, vs_path, chunk_conent,
+                                        score_threshold=VECTOR_SEARCH_SCORE_THRESHOLD,
+                                        vector_search_top_k=VECTOR_SEARCH_TOP_K, chunk_size=CHUNK_SIZE):
+        vector_store = load_vector_store(vs_path, self.embeddings)
+        # FAISS.similarity_search_with_score_by_vector = similarity_search_with_score_by_vector
+        vector_store.chunk_conent = chunk_conent
+        vector_store.score_threshold = score_threshold
+        vector_store.chunk_size = chunk_size
+        related_docs_with_score = vector_store.similarity_search_with_score(query, k=vector_search_top_k)
+        if not related_docs_with_score:
+            response = {"query": query,
+                        "source_documents": []}
+            return response, ""
+        torch_gc()
+        prompt = "\n".join([doc.page_content for doc in related_docs_with_score])
+        response = {"query": query,
+                    "source_documents": related_docs_with_score}
+        return response, prompt
+
+    def get_search_result_based_answer(self, query, chat_history=[], streaming: bool = STREAMING):
+        results = bing_search(query)
+        result_docs = search_result2docs(results)
+        prompt = generate_prompt(result_docs, query)
+
+        for answer_result in self.llm.generatorAnswer(prompt=prompt, history=chat_history,
+                                                      streaming=streaming):
+            resp = answer_result.llm_output["answer"]
+            history = answer_result.history
+            history[-1][0] = query
+            response = {"query": query,
+                        "result": resp,
+                        "source_documents": result_docs}
+            yield response, history
+
+    def delete_file_from_vector_store(self,
+                                      filepath: str or List[str],
+                                      vs_path):
+        vector_store = load_vector_store(vs_path, self.embeddings)
+        status = vector_store.delete_doc(filepath)
+        return status
+
+    def update_file_from_vector_store(self,
+                                      filepath: str or List[str],
+                                      vs_path,
+                                      docs: List[Document],):
+        vector_store = load_vector_store(vs_path, self.embeddings)
+        status = vector_store.update_doc(filepath, docs)
+        return status
+
+    def list_file_from_vector_store(self,
+                                    vs_path,
+                                    fullpath=False):
+        vector_store = load_vector_store(vs_path, self.embeddings)
+        docs = vector_store.list_docs()
+        if fullpath:
+            return docs
+        else:
+            return [os.path.split(doc)[-1] for doc in docs]
+
+
+if __name__ == "__main__":
+    # 初始化消息
+    args = None
+    args = parser.parse_args(args=['--model-dir', '/media/checkpoint/', '--model', 'chatglm-6b', '--no-remote-model'])
+
+    args_dict = vars(args)
+    shared.loaderCheckPoint = LoaderCheckPoint(args_dict)
+    llm_model_ins = shared.loaderLLM()
+    llm_model_ins.set_history_len(LLM_HISTORY_LEN)
+
+    local_doc_qa = LocalDocQA()
+    local_doc_qa.init_cfg(llm_model=llm_model_ins)
+    query = "本项目使用的embedding模型是什么，消耗多少显存"
+    vs_path = "/media/gpt4-pdf-chatbot-langchain/dev-langchain-ChatGLM/vector_store/test"
+    last_print_len = 0
+    # for resp, history in local_doc_qa.get_knowledge_based_answer(query=query,
+    #                                                              vs_path=vs_path,
+    #                                                              chat_history=[],
+    #                                                              streaming=True):
+    for resp, history in local_doc_qa.get_search_result_based_answer(query=query,
+                                                                     chat_history=[],
+                                                                     streaming=True):
+        print(resp["result"][last_print_len:], end="", flush=True)
+        last_print_len = len(resp["result"])
+    source_text = [f"""出处 [{inum + 1}] {doc.metadata['source'] if doc.metadata['source'].startswith("http")
+    else os.path.split(doc.metadata['source'])[-1]}：\n\n{doc.page_content}\n\n"""
+                   # f"""相关度：{doc.metadata['score']}\n\n"""
+                   for inum, doc in
+                   enumerate(resp["source_documents"])]
+    logger.info("\n\n" + "\n\n".join(source_text))
+    pass
